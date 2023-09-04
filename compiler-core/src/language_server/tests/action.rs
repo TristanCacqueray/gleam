@@ -11,9 +11,9 @@ fn remove_unused_action(src: &str) -> Option<String> {
     let mut engine = setup_engine(&io);
 
     // inject stdlib stubs
-    _ = io.src_module("gleam/list", "");
-    _ = io.src_module("gleam/result", "pub fn is_ok() {}");
-    _ = io.src_module("gleam/option", "");
+    _ = io.src_module("list", "");
+    _ = io.src_module("result", "pub fn is_ok() {}");
+    _ = io.src_module("option", "");
 
     _ = io.src_module("app", src);
     engine.compile_please().result.expect("compiled");
@@ -94,9 +94,9 @@ fn test_remove_unused_action() {
     let code = "
 // test
 import // comment
-  gleam/list as lispy
-import gleam/result
-import gleam/option
+  list as lispy
+import result
+import option
 
 pub fn main() {
   result.is_ok
@@ -104,7 +104,7 @@ pub fn main() {
 ";
     let expected = "
 // test
-import gleam/result
+import result
 
 pub fn main() {
   result.is_ok
