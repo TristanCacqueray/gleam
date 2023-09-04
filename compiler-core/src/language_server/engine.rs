@@ -237,18 +237,14 @@ where
                 .context
                 .diagnostics
                 .iter()
-                .find(|diag| diag.message.starts_with("Unused"))
-                .is_some()
+                .any(|diag| diag.message.starts_with("Unused"))
             {
-                match this
+                if let Some(ranges) = this
                     .unused_warnings_locations
                     .get(&Into::<Utf8PathBuf>::into(params.text_document.uri.path()))
                 {
-                    Some(ranges) => {
-                        // Unused ranges were previously computed, offer a new code action:
-                        actions.push(make_unused_code_action(params.text_document.uri, ranges))
-                    }
-                    None => (),
+                    // Unused ranges were previously computed, offer a new code action:
+                    actions.push(make_unused_code_action(params.text_document.uri, ranges))
                 }
             }
 
@@ -307,19 +303,22 @@ where
 
         // Record unused locations
         for warning in warnings {
-            match warning {
-                Warning::Type { path, warning, .. } => match warning {
+            if let Warning::Type { path, warning, .. } = warning {
+                match warning {
                     crate::type_::Warning::UnusedImportedModule { location, .. } => {
-                        match self.module_code(path).and_then(|(line_number, code)| {
-                            self.handle_unused_imported_module(&line_number, &code, location)
-                        }) {
-                            Some(range) => self.store_unused_warning_range(path, range),
-                            None => (),
+                        if let Some(range) =
+                            self.module_code(path).and_then(|(line_number, code)| {
+                                self.handle_unused_imported_module(&line_number, &code, location)
+                            })
+                        {
+                            self.store_unused_warning_range(path, range)
                         }
                     }
+                    crate::type_::Warning::UnusedImportedValue { location, .. } => {
+                        eprintln!("Got unused value at {:?}", location);
+                    }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
     }
@@ -654,7 +653,7 @@ fn make_unused_code_action(uri: Url, ranges: &[lsp_types::Range]) -> lsp_types::
     let edits = ranges
         .iter()
         .map(|range| lsp_types::TextEdit {
-            range: range.clone(),
+            range: *range,
             new_text: "".to_string(),
         })
         .collect();
