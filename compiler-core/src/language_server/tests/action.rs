@@ -12,7 +12,10 @@ fn remove_unused_action(src: &str) -> Option<String> {
 
     // inject stdlib stubs
     _ = io.src_module("list", "");
-    _ = io.src_module("result", "pub fn is_ok() {}");
+    _ = io.src_module(
+        "result",
+        "pub fn is_ok() {}\npub fn is_err() {}\npub fn all() {}",
+    );
     _ = io.src_module("option", "");
 
     _ = io.src_module("app", src);
@@ -108,6 +111,94 @@ import result
 
 pub fn main() {
   result.is_ok
+}
+";
+    assert_eq!(remove_unused_action(code), Some(expected.to_string()))
+}
+
+#[test]
+fn test_remove_unused_qualified_action() {
+    let code = "
+// test
+import result.{is_ok}
+";
+    let expected = "
+// test
+";
+    assert_eq!(remove_unused_action(code), Some(expected.to_string()))
+}
+
+#[test]
+fn test_remove_unused_qualified_with_name_action() {
+    let code = "
+// test
+import result.{is_ok} as res
+";
+    let expected = "
+// test
+import result as res
+";
+    assert_eq!(remove_unused_action(code), Some(expected.to_string()))
+}
+
+#[test]
+fn test_remove_unused_qualified_partial_action() {
+    let code = "
+// test
+import result.{is_ok, is_err}
+
+pub fn main() {
+  is_ok
+}
+";
+    let expected = "
+// test
+import result.{is_ok}
+
+pub fn main() {
+  is_ok
+}
+";
+    assert_eq!(remove_unused_action(code), Some(expected.to_string()))
+}
+
+#[test]
+fn test_remove_unused_qualified_partial2_action() {
+    let code = "
+// test
+import result.{all, is_ok, is_err}
+
+pub fn main() {
+  is_ok
+}
+";
+    let expected = "
+// test
+import result.{is_ok}
+
+pub fn main() {
+  is_ok
+}
+";
+    assert_eq!(remove_unused_action(code), Some(expected.to_string()))
+}
+
+#[test]
+fn test_remove_unused_qualified_partial3_action() {
+    let code = "
+// test
+import result.{all, is_ok, is_err} as res
+
+pub fn main() {
+  is_ok
+}
+";
+    let expected = "
+// test
+import result.{is_ok} as res
+
+pub fn main() {
+  is_ok
 }
 ";
     assert_eq!(remove_unused_action(code), Some(expected.to_string()))

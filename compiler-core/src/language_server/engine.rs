@@ -228,7 +228,6 @@ where
         &mut self,
         params: lsp::CodeActionParams,
     ) -> Response<Option<Vec<lsp_types::CodeAction>>> {
-        eprintln!("Got a new action request: {:?}", params);
         self.respond(|this| {
             let mut actions = vec![];
 
@@ -249,22 +248,11 @@ where
         })
     }
 
-    fn module_code(&self, path: &Utf8PathBuf) -> Option<(LineNumbers, SmolStr)> {
+    fn module_code(&self, path: &Utf8PathBuf) -> Option<(LineNumbers, &'_ Module, SmolStr)> {
         let uri = crate::language_server::server::path_to_uri(path.clone());
         let module = self.module_for_uri(&uri)?;
         let line_numbers = LineNumbers::new(&module.code);
-        Some((line_numbers, module.code.clone()))
-    }
-
-    fn store_unused_warning_range(&mut self, path: &Utf8PathBuf, range: lsp_types::Range) {
-        match self.unused_warnings_locations.get_mut(path) {
-            None => {
-                let _ = self
-                    .unused_warnings_locations
-                    .insert(path.clone(), vec![range]);
-            }
-            Some(vec) => vec.push(range),
-        }
+        Some((line_numbers, module, module.code.clone()))
     }
 
     // This function remember unused warning locations for the related code action.
@@ -274,26 +262,76 @@ where
             let _ = self.unused_warnings_locations.remove(module);
         }
 
-        // Record unused locations
+        // Group warnings per module
+        let mut warnings_per_module: HashMap<Utf8PathBuf, Vec<&crate::type_::Warning>> =
+            HashMap::new();
         for warning in warnings {
             if let Warning::Type { path, warning, .. } = warning {
-                // TODO: cache this call to avoid repeated cloning.
-                if let Some((line_numbers, code)) = self.module_code(path) {
-                    if let Some(range) = match warning {
+                if let Some(vec) = warnings_per_module.get_mut(path) {
+                    vec.push(warning);
+                } else {
+                    let _ = warnings_per_module.insert(path.clone(), vec![warning]);
+                }
+            }
+        }
+
+        let mut ranges_per_location: HashMap<Utf8PathBuf, Vec<lsp_types::Range>> = HashMap::new();
+
+        // Record unused locations
+        for (path, warnings) in warnings_per_module.drain() {
+            if let Some((line_numbers, module, code)) = self.module_code(&path) {
+                let mut qual_per_module: HashMap<SmolStr, QualifiedUnusedInfo> = HashMap::new();
+                for warning in warnings {
+                    match warning {
                         crate::type_::Warning::UnusedImportedModule { location, .. } => {
-                            handle_unused_imported_module(&line_numbers, &code, location)
+                            if let Some(range) =
+                                handle_unused_imported_module(&line_numbers, &code, location)
+                            {
+                                store_unused_warning_range(&mut ranges_per_location, &path, range);
+                            }
                         }
 
                         crate::type_::Warning::UnusedImportedValue { location, .. } => {
-                            eprintln!("Got unused value at {:?}", location);
-                            None
+                            if let Some(Located::ModuleStatement(
+                                crate::language_server::engine::Definition::Import(import),
+                            )) = module.find_node(location.start)
+                            {
+                                // Store the qualified import details now, we'll process it after.
+                                match qual_per_module.get_mut(&import.module) {
+                                    Some(info) => info.unused.push(*location),
+                                    None => {
+                                        let _ = qual_per_module.insert(
+                                            import.module.clone(),
+                                            QualifiedUnusedInfo {
+                                                unqualified_count: import.unqualified.len(),
+                                                has_name: import.as_name.is_some(),
+                                                location: import.location,
+                                                unused: vec![*location],
+                                            },
+                                        );
+                                    }
+                                }
+                            };
                         }
-                        _ => None,
-                    } {
-                        self.store_unused_warning_range(path, range)
+                        _ => (),
+                    }
+                }
+
+                for (_, info) in qual_per_module.drain() {
+                    if let Some(ranges) =
+                        handle_unused_imported_module_qualified(&line_numbers, &code, &info)
+                    {
+                        for range in ranges {
+                            store_unused_warning_range(&mut ranges_per_location, &path, range);
+                        }
                     }
                 }
             }
+        }
+
+        // Copy all the ranges to the engine.
+        for (path, ranges) in ranges_per_location.drain() {
+            let _ = self.unused_warnings_locations.insert(path, ranges);
         }
     }
 
@@ -630,6 +668,19 @@ fn is_action_attached_to_unused_diagnostic(params: &lsp::CodeActionParams) -> bo
         .any(|diag| diag.message.starts_with("Unused"))
 }
 
+fn store_unused_warning_range(
+    cache: &mut HashMap<Utf8PathBuf, Vec<lsp_types::Range>>,
+    path: &Utf8PathBuf,
+    range: lsp_types::Range,
+) {
+    match cache.get_mut(path) {
+        None => {
+            let _ = cache.insert(path.clone(), vec![range]);
+        }
+        Some(vec) => vec.push(range),
+    }
+}
+
 // This function handle UnusedImportedModule warning.
 // It finds the full range of the import statement,
 // because the warning only contains the location of the module name.
@@ -652,6 +703,72 @@ fn handle_unused_imported_module(
     // The src span of the full import statement.
     let full_location = SrcSpan { start, end };
     Some(src_span_to_lsp_range(full_location, line_numbers))
+}
+
+#[derive(Debug)]
+struct QualifiedUnusedInfo {
+    unqualified_count: usize,
+    has_name: bool,
+    location: SrcSpan,
+    unused: Vec<SrcSpan>,
+}
+fn handle_unused_imported_module_qualified(
+    line_numbers: &LineNumbers,
+    code: &SmolStr,
+    info: &QualifiedUnusedInfo,
+) -> Option<Vec<lsp_types::Range>> {
+    if info.unqualified_count == info.unused.len() {
+        let (before, after) = code.split_at(info.location.start as usize);
+        if !info.has_name {
+            // We can safely remove the whole import
+            // Find the previous import keyword.
+            let import_location = before.rfind("import")? as u32;
+            let start = if import_location > 0 {
+                // Consume the previous line return.
+                import_location - 1
+            } else {
+                import_location
+            };
+            // Find the closing '}'.
+            let closing_bracket = after.find('}')?;
+            // Find the last '\n'
+            let (_, rest) = after.split_at(closing_bracket);
+            let end = info.location.start + ((closing_bracket + rest.find('\n')?) as u32);
+            // The src span of the full import statement.
+            let full_location = SrcSpan { start, end };
+            Some(vec![src_span_to_lsp_range(full_location, line_numbers)])
+        } else {
+            // We can only remove the qualified block.
+            let start = info.location.start + after.find(".{")? as u32;
+            let end = info.location.start + 1 + after.find("}")? as u32;
+            let full_location = SrcSpan { start, end };
+            Some(vec![src_span_to_lsp_range(full_location, line_numbers)])
+        }
+    } else {
+        // We can only remove individual elems.
+        let mut ranges = Vec::new();
+        for span in &info.unused {
+            let (before, after) = code.split_at(span.start as usize);
+            let start = match before.rfind(',') {
+                Some(comma_loc) if Some(comma_loc) > before.rfind("import") => comma_loc as u32,
+                _ => span.start,
+            };
+            let end = if start == span.start {
+                let (_, rest) = after.split_at(after.find(',')?);
+                let whitespaces = rest
+                    .chars()
+                    .take_while(|c| matches!(c, ',' | '\n' | ' '))
+                    .collect::<Vec<_>>()
+                    .len();
+                span.end + whitespaces as u32
+            } else {
+                span.end
+            };
+            let full_location = SrcSpan { start, end };
+            ranges.push(src_span_to_lsp_range(full_location, line_numbers))
+        }
+        Some(ranges)
+    }
 }
 
 // Convert a list of unused range into a "Remove unused" code action.
