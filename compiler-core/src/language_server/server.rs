@@ -589,7 +589,7 @@ fn diagnostic_to_lsp(diagnostic: Diagnostic) -> Vec<lsp::Diagnostic> {
     }
 }
 
-fn path_to_uri(path: Utf8PathBuf) -> Url {
+pub fn path_to_uri(path: Utf8PathBuf) -> Url {
     let mut file: String = "file://".into();
     file.push_str(&path.as_os_str().to_string_lossy());
     Url::parse(&file).expect("path_to_uri URL parse")

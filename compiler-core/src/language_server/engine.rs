@@ -8,7 +8,7 @@ use crate::{
     config::PackageConfig,
     io::{CommandExecutor, FileSystemReader, FileSystemWriter},
     language_server::{
-        compiler::LspProjectCompiler, files::FileSystemProxy, progress::ProgressReporter,
+        compiler::LspProjectCompiler, files::FileSystemProxy, progress::ProgressReporter, SrcSpan,
     },
     line_numbers::LineNumbers,
     paths::ProjectPaths,
@@ -18,6 +18,7 @@ use crate::{
 use camino::Utf8PathBuf;
 use lsp_types::{self as lsp, Hover, HoverContents, MarkedString, Url};
 use smol_str::SmolStr;
+use std::collections::HashMap;
 use strum::IntoEnumIterator;
 
 use super::{src_span_to_lsp_range, DownloadDependencies, MakeLocker};
@@ -53,6 +54,9 @@ pub struct LanguageServerEngine<IO, Reporter> {
     // Used to publish progress notifications to the client without waiting for
     // the usual request-response loop.
     progress_reporter: Reporter,
+
+    /// The storage for unused warning location.
+    unused_warnings_locations: HashMap<Utf8PathBuf, Vec<lsp_types::Range>>,
 }
 
 impl<'a, IO, Reporter> LanguageServerEngine<IO, Reporter>
@@ -90,6 +94,7 @@ where
         Ok(Self {
             modules_compiled_since_last_feedback: vec![],
             compiled_since_last_feedback: false,
+            unused_warnings_locations: HashMap::new(),
             progress_reporter,
             compiler,
             paths,
@@ -227,54 +232,96 @@ where
         self.respond(|this| {
             let mut actions = vec![];
 
-            // question: how to get the current module warnings?
-            // These could be used to generate a single code action to fix all the unused warnings at once?
-            eprintln!("Why is this empty? {:?}", this.compiler.warnings);
-
-            // here is a demo action:
-            match params
+            // Check if unused removal can be performed
+            if params
                 .context
                 .diagnostics
                 .iter()
-                .find(|diag| diag.message.starts_with("Unused imported"))
+                .find(|diag| diag.message.starts_with("Unused"))
+                .is_some()
             {
-                Some(diag) => {
-                    let edit = lsp_types::TextEdit {
-                        range: lsp_types::Range::new(
-                            lsp_types::Position {
-                                line: diag.range.start.line,
-                                character: 0,
-                            },
-                            lsp_types::Position {
-                                line: diag.range.start.line + 1,
-                                character: 0,
-                            },
-                        ),
-                        new_text: "".to_string(),
-                    };
-                    let mut changes = std::collections::HashMap::new();
-                    let _ = changes.insert(params.text_document.uri, vec![edit]);
-                    let action = lsp_types::CodeAction {
-                        title: "Remove unused imports".to_string(),
-                        kind: None,
-                        diagnostics: None,
-                        edit: Some(lsp_types::WorkspaceEdit {
-                            changes: Some(changes),
-                            document_changes: None,
-                            change_annotations: None,
-                        }),
-                        command: None,
-                        is_preferred: Some(true),
-                        disabled: None,
-                        data: None,
-                    };
-                    actions.push(action)
+                match this
+                    .unused_warnings_locations
+                    .get(&Into::<Utf8PathBuf>::into(params.text_document.uri.path()))
+                {
+                    Some(ranges) => {
+                        // Unused ranges were previously computed, offer a new code action:
+                        actions.push(make_unused_code_action(params.text_document.uri, ranges))
+                    }
+                    None => (),
                 }
-                None => (),
             }
 
-            Ok(Some(actions))
+            Ok(if actions.is_empty() {
+                None
+            } else {
+                Some(actions)
+            })
         })
+    }
+
+    // This function handle UnusedImportedModule warning.
+    // It finds the full range of the import statement,
+    // because the warning only contains the location of the module name.
+    fn handle_unused_imported_module(
+        &mut self,
+        line_numbers: &LineNumbers,
+        code: &SmolStr,
+        location: &SrcSpan,
+    ) -> Option<lsp_types::Range> {
+        let (before, after) = code.split_at(location.start as usize);
+        // Find the previous import keyword.
+        let start = before.rfind("import")? as u32;
+        // Find the next line return.
+        let end = location.start + (after.find('\n')? as u32);
+        // The src span of the full import statement.
+        let full_location = SrcSpan { start, end };
+        Some(src_span_to_lsp_range(full_location, line_numbers))
+    }
+
+    // TODO: cache this call to avoid repeated cloning?
+    fn module_code(&self, path: &Utf8PathBuf) -> Option<(LineNumbers, SmolStr)> {
+        let uri = crate::language_server::server::path_to_uri(path.clone());
+        let module = self.module_for_uri(&uri)?;
+        let line_numbers = LineNumbers::new(&module.code);
+        Some((line_numbers, module.code.clone()))
+    }
+
+    fn store_unused_warning_range(&mut self, path: &Utf8PathBuf, range: lsp_types::Range) {
+        match self.unused_warnings_locations.get_mut(path) {
+            None => {
+                let _ = self
+                    .unused_warnings_locations
+                    .insert(path.clone(), vec![range]);
+            }
+            Some(vec) => vec.push(range),
+        }
+    }
+
+    // This function remember unused warning locations for the related code action.
+    fn store_unused_warnings(&mut self, modules: &[Utf8PathBuf], warnings: &[Warning]) {
+        // Remove previous locations of the newly compiled module
+        for module in modules {
+            let _ = self.unused_warnings_locations.remove(module);
+        }
+
+        // Record unused locations
+        for warning in warnings {
+            match warning {
+                Warning::Type { path, warning, .. } => match warning {
+                    crate::type_::Warning::UnusedImportedModule { location, .. } => {
+                        match self.module_code(path).and_then(|(line_number, code)| {
+                            self.handle_unused_imported_module(&line_number, &code, location)
+                        }) {
+                            Some(range) => self.store_unused_warning_range(path, range),
+                            None => (),
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
     }
 
     fn respond<T>(&mut self, handler: impl FnOnce(&mut Self) -> Result<T>) -> Response<T> {
@@ -284,6 +331,7 @@ where
         let compilation = if self.compiled_since_last_feedback {
             let modules = std::mem::take(&mut self.modules_compiled_since_last_feedback);
             self.compiled_since_last_feedback = false;
+            self.store_unused_warnings(&modules, &warnings);
             Compilation::Yes(modules)
         } else {
             Compilation::No
@@ -598,5 +646,32 @@ fn hover_for_expression(expression: &TypedExpr, line_numbers: LineNumbers) -> Ho
     Hover {
         contents: HoverContents::Scalar(MarkedString::String(contents)),
         range: Some(src_span_to_lsp_range(expression.location(), &line_numbers)),
+    }
+}
+
+// Convert a list of unused range into a "Remove unused" code action.
+fn make_unused_code_action(uri: Url, ranges: &[lsp_types::Range]) -> lsp_types::CodeAction {
+    let edits = ranges
+        .iter()
+        .map(|range| lsp_types::TextEdit {
+            range: range.clone(),
+            new_text: "".to_string(),
+        })
+        .collect();
+    let mut changes = std::collections::HashMap::new();
+    let _ = changes.insert(uri, edits);
+    lsp_types::CodeAction {
+        title: "Remove unused imports".to_string(),
+        kind: None,
+        diagnostics: None,
+        edit: Some(lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: Some(true),
+        disabled: None,
+        data: None,
     }
 }
