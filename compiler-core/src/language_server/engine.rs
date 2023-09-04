@@ -233,16 +233,9 @@ where
             let mut actions = vec![];
 
             // Check if unused removal can be performed
-            if params
-                .context
-                .diagnostics
-                .iter()
-                .any(|diag| diag.message.starts_with("Unused"))
-            {
-                if let Some(ranges) = this
-                    .unused_warnings_locations
-                    .get(&Into::<Utf8PathBuf>::into(params.text_document.uri.path()))
-                {
+            if is_action_attached_to_unused_diagnostic(&params) {
+                let path: Utf8PathBuf = params.text_document.uri.path().into();
+                if let Some(ranges) = this.unused_warnings_locations.get(&path) {
                     // Unused ranges were previously computed, offer a new code action:
                     actions.push(make_unused_code_action(params.text_document.uri, ranges))
                 }
@@ -256,26 +249,6 @@ where
         })
     }
 
-    // This function handle UnusedImportedModule warning.
-    // It finds the full range of the import statement,
-    // because the warning only contains the location of the module name.
-    fn handle_unused_imported_module(
-        &mut self,
-        line_numbers: &LineNumbers,
-        code: &SmolStr,
-        location: &SrcSpan,
-    ) -> Option<lsp_types::Range> {
-        let (before, after) = code.split_at(location.start as usize);
-        // Find the previous import keyword.
-        let start = before.rfind("import")? as u32;
-        // Find the next line return.
-        let end = location.start + (after.find('\n')? as u32);
-        // The src span of the full import statement.
-        let full_location = SrcSpan { start, end };
-        Some(src_span_to_lsp_range(full_location, line_numbers))
-    }
-
-    // TODO: cache this call to avoid repeated cloning?
     fn module_code(&self, path: &Utf8PathBuf) -> Option<(LineNumbers, SmolStr)> {
         let uri = crate::language_server::server::path_to_uri(path.clone());
         let module = self.module_for_uri(&uri)?;
@@ -304,20 +277,21 @@ where
         // Record unused locations
         for warning in warnings {
             if let Warning::Type { path, warning, .. } = warning {
-                match warning {
-                    crate::type_::Warning::UnusedImportedModule { location, .. } => {
-                        if let Some(range) =
-                            self.module_code(path).and_then(|(line_number, code)| {
-                                self.handle_unused_imported_module(&line_number, &code, location)
-                            })
-                        {
-                            self.store_unused_warning_range(path, range)
+                // TODO: cache this call to avoid repeated cloning.
+                if let Some((line_numbers, code)) = self.module_code(path) {
+                    if let Some(range) = match warning {
+                        crate::type_::Warning::UnusedImportedModule { location, .. } => {
+                            handle_unused_imported_module(&line_numbers, &code, location)
                         }
+
+                        crate::type_::Warning::UnusedImportedValue { location, .. } => {
+                            eprintln!("Got unused value at {:?}", location);
+                            None
+                        }
+                        _ => None,
+                    } {
+                        self.store_unused_warning_range(path, range)
                     }
-                    crate::type_::Warning::UnusedImportedValue { location, .. } => {
-                        eprintln!("Got unused value at {:?}", location);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -648,10 +622,45 @@ fn hover_for_expression(expression: &TypedExpr, line_numbers: LineNumbers) -> Ho
     }
 }
 
+fn is_action_attached_to_unused_diagnostic(params: &lsp::CodeActionParams) -> bool {
+    params
+        .context
+        .diagnostics
+        .iter()
+        .any(|diag| diag.message.starts_with("Unused"))
+}
+
+// This function handle UnusedImportedModule warning.
+// It finds the full range of the import statement,
+// because the warning only contains the location of the module name.
+fn handle_unused_imported_module(
+    line_numbers: &LineNumbers,
+    code: &SmolStr,
+    location: &SrcSpan,
+) -> Option<lsp_types::Range> {
+    let (before, after) = code.split_at(location.start as usize);
+    // Find the previous import keyword.
+    let import_location = before.rfind("import")? as u32;
+    let start = if import_location > 0 {
+        // Consume the previous line return.
+        import_location - 1
+    } else {
+        import_location
+    };
+    // Find the next line return.
+    let end = location.start + (after.find('\n')? as u32);
+    // The src span of the full import statement.
+    let full_location = SrcSpan { start, end };
+    Some(src_span_to_lsp_range(full_location, line_numbers))
+}
+
 // Convert a list of unused range into a "Remove unused" code action.
 fn make_unused_code_action(uri: Url, ranges: &[lsp_types::Range]) -> lsp_types::CodeAction {
+    use itertools::Itertools;
+
     let edits = ranges
         .iter()
+        .sorted_by(|a, b| Ord::cmp(&a.start, &b.start))
         .map(|range| lsp_types::TextEdit {
             range: *range,
             new_text: "".to_string(),

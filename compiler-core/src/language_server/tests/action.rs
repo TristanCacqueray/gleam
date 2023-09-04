@@ -92,6 +92,7 @@ fn apply_code_action(src: &str, action: &lsp_types::CodeAction) -> String {
 #[test]
 fn test_remove_unused_action() {
     let code = "
+// test
 import // comment
   gleam/list as lispy
 import gleam/result
@@ -102,9 +103,8 @@ pub fn main() {
 }
 ";
     let expected = "
-
+// test
 import gleam/result
-
 
 pub fn main() {
   result.is_ok
