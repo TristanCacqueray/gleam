@@ -681,6 +681,20 @@ fn store_unused_warning_range(
     }
 }
 
+fn import_token_location(before: &str) -> Option<usize> {
+    let pos = before.rfind("import")?;
+    // Consume the previous line return if it exists.
+    Some(if pos > 0 { pos - 1 } else { pos })
+}
+
+fn mk_range(line_numbers: &LineNumbers, start: usize, end: usize) -> lsp_types::Range {
+    let location = SrcSpan {
+        start: start as u32,
+        end: end as u32,
+    };
+    src_span_to_lsp_range(location, line_numbers)
+}
+
 // This function handle UnusedImportedModule warning.
 // It finds the full range of the import statement,
 // because the warning only contains the location of the module name.
@@ -691,18 +705,11 @@ fn handle_unused_imported_module(
 ) -> Option<lsp_types::Range> {
     let (before, after) = code.split_at(location.start as usize);
     // Find the previous import keyword.
-    let import_location = before.rfind("import")? as u32;
-    let start = if import_location > 0 {
-        // Consume the previous line return.
-        import_location - 1
-    } else {
-        import_location
-    };
+    let start = import_token_location(before)?;
     // Find the next line return.
-    let end = location.start + (after.find('\n')? as u32);
+    let end = location.start as usize + (after.find('\n')?);
     // The src span of the full import statement.
-    let full_location = SrcSpan { start, end };
-    Some(src_span_to_lsp_range(full_location, line_numbers))
+    Some(mk_range(line_numbers, start, end))
 }
 
 #[derive(Debug)]
@@ -718,54 +725,45 @@ fn handle_unused_imported_module_qualified(
     info: &QualifiedUnusedInfo,
 ) -> Option<Vec<lsp_types::Range>> {
     if info.unqualified_count == info.unused.len() {
+        // All the qualified import are unused, we can remove the whole import line
         let (before, after) = code.split_at(info.location.start as usize);
         if !info.has_name {
-            // We can safely remove the whole import
             // Find the previous import keyword.
-            let import_location = before.rfind("import")? as u32;
-            let start = if import_location > 0 {
-                // Consume the previous line return.
-                import_location - 1
-            } else {
-                import_location
-            };
+            let start = import_token_location(before)?;
             // Find the closing '}'.
             let closing_bracket = after.find('}')?;
             // Find the last '\n'
             let (_, rest) = after.split_at(closing_bracket);
-            let end = info.location.start + ((closing_bracket + rest.find('\n')?) as u32);
-            // The src span of the full import statement.
-            let full_location = SrcSpan { start, end };
-            Some(vec![src_span_to_lsp_range(full_location, line_numbers)])
+            let end = info.location.start as usize + (closing_bracket + rest.find('\n')?);
+            Some(vec![mk_range(line_numbers, start, end)])
         } else {
-            // We can only remove the qualified block.
-            let start = info.location.start + after.find(".{")? as u32;
-            let end = info.location.start + 1 + after.find("}")? as u32;
-            let full_location = SrcSpan { start, end };
-            Some(vec![src_span_to_lsp_range(full_location, line_numbers)])
+            // Unless the import as a name, then we don't know and we should keep it
+            let start = info.location.start as usize + after.find(".{")?;
+            let end = info.location.start as usize + 1 + after.find('}')?;
+            Some(vec![mk_range(line_numbers, start, end)])
         }
     } else {
         // We can only remove individual elems.
         let mut ranges = Vec::new();
         for span in &info.unused {
             let (before, after) = code.split_at(span.start as usize);
-            let start = match before.rfind(',') {
-                Some(comma_loc) if Some(comma_loc) > before.rfind("import") => comma_loc as u32,
-                _ => span.start,
+            let (start, end) = match before.rfind(',') {
+                Some(comma_loc) if Some(comma_loc) > before.rfind("import") => {
+                    // This is not the first qualified name, we drop until the previous comma.
+                    (comma_loc, span.end as usize)
+                }
+                _ => {
+                    // This is the first qualified name, we drop until after the next comma.
+                    let (_, rest) = after.split_at(after.find(',')?);
+                    let whitespaces = rest
+                        .chars()
+                        .take_while(|c| matches!(c, ',' | '\n' | ' '))
+                        .collect::<Vec<_>>()
+                        .len();
+                    (span.start as usize, span.end as usize + whitespaces)
+                }
             };
-            let end = if start == span.start {
-                let (_, rest) = after.split_at(after.find(',')?);
-                let whitespaces = rest
-                    .chars()
-                    .take_while(|c| matches!(c, ',' | '\n' | ' '))
-                    .collect::<Vec<_>>()
-                    .len();
-                span.end + whitespaces as u32
-            } else {
-                span.end
-            };
-            let full_location = SrcSpan { start, end };
-            ranges.push(src_span_to_lsp_range(full_location, line_numbers))
+            ranges.push(mk_range(line_numbers, start, end))
         }
         Some(ranges)
     }
