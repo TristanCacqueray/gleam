@@ -1,3 +1,4 @@
+use crate::ast::SrcSpan;
 use crate::{
     ast::TodoKind,
     build::Target,
@@ -8,6 +9,7 @@ use crate::{
 use camino::Utf8PathBuf;
 use debug_ignore::DebugIgnore;
 use smol_str::SmolStr;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::{
     io::Write,
@@ -17,6 +19,7 @@ use termcolor::Buffer;
 
 pub trait WarningEmitterIO {
     fn emit_warning(&self, warning: Warning);
+    fn emit_unused(&self, module_path: &Utf8PathBuf, location: SrcSpan);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,11 +27,13 @@ pub struct NullWarningEmitterIO;
 
 impl WarningEmitterIO for NullWarningEmitterIO {
     fn emit_warning(&self, _warning: Warning) {}
+    fn emit_unused(&self, _module_path: &Utf8PathBuf, _location: SrcSpan) {}
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct VectorWarningEmitterIO {
     pub warnings: Arc<std::sync::RwLock<Vec<Warning>>>,
+    unused: Arc<std::sync::RwLock<HashMap<Utf8PathBuf, Vec<SrcSpan>>>>,
 }
 
 impl VectorWarningEmitterIO {
@@ -40,12 +45,32 @@ impl VectorWarningEmitterIO {
     fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, Vec<Warning>> {
         self.warnings.write().expect("Vector lock poisoned")
     }
+
+    pub fn take_unused(&self) -> HashMap<Utf8PathBuf, Vec<SrcSpan>> {
+        let mut unused = self.unused_write_lock();
+        std::mem::take(&mut *unused)
+    }
+
+    fn unused_write_lock(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<Utf8PathBuf, Vec<SrcSpan>>> {
+        self.unused.write().expect("Unused lock poisoned")
+    }
 }
 
 impl WarningEmitterIO for VectorWarningEmitterIO {
     fn emit_warning(&self, warning: Warning) {
         let mut warnings = self.write_lock();
         warnings.push(warning);
+    }
+    fn emit_unused(&self, module_path: &Utf8PathBuf, location: SrcSpan) {
+        let mut unused = self.unused_write_lock();
+        match unused.get_mut(module_path) {
+            None => {
+                let _ = unused.insert(module_path.clone(), vec![location]);
+            }
+            Some(vec) => vec.push(location),
+        }
     }
 }
 
@@ -122,6 +147,12 @@ impl TypeWarningEmitter {
             warning,
         });
     }
+
+    pub fn emit_unused(&self, location: SrcSpan) {
+        self.emitter
+            .emitter
+            .emit_unused(&self.module_path, location)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -193,7 +224,7 @@ impl Warning {
                 crate::parse::Warning::DeprecatedTodo { location, message } => {
                     let text = format!(
                         "The `todo()` syntax has been replaced by this syntax:
-                        
+
     todo as \"{message}\"\n"
                     );
                     Diagnostic {

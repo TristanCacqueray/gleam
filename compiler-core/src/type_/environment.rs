@@ -487,6 +487,7 @@ impl<'a> Environment<'a> {
         for (name, location) in self.unused_modules.clone().into_iter() {
             self.warnings
                 .emit(Warning::UnusedImportedModule { name, location });
+            self.warnings.emit_unused(location);
         }
     }
 

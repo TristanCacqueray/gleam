@@ -108,6 +108,9 @@ where
         // we don't bother them with diagnostics for them.
         let _ = self.take_warnings();
 
+        // Similarly, unused location from dependencies are not relevant.
+        let _ = self.warnings.take_unused();
+
         // Do that there compilation. We don't use `?` to return early in the
         // event of an error because we _always_ want to do the restoration of
         // state afterwards.
