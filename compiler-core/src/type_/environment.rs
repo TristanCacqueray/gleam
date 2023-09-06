@@ -23,6 +23,9 @@ pub struct Environment<'a> {
     pub unused_modules: HashMap<SmolStr, SrcSpan>,
     pub imported_types: HashSet<SmolStr>,
 
+    /// Unqualified names that are unused
+    pub unused_unqualified: HashMap<SmolStr, Vec<SrcSpan>>,
+
     /// Values defined in the current function (or the prelude)
     pub scope: im::HashMap<SmolStr, ValueConstructor>,
 
@@ -68,6 +71,7 @@ impl<'a> Environment<'a> {
             module_values: HashMap::new(),
             imported_modules: HashMap::new(),
             unused_modules: HashMap::new(),
+            unused_unqualified: HashMap::new(),
             unqualified_imported_names: HashMap::new(),
             accessors: prelude.accessors.clone(),
             scope: prelude.values.clone().into(),
@@ -87,10 +91,11 @@ pub enum EntityKind {
     // String here is the type constructor's type name
     PrivateTypeConstructor(SmolStr),
     PrivateFunction,
-    ImportedConstructor,
-    ImportedType,
-    ImportedTypeAndConstructor,
-    ImportedValue,
+    // Strings here are the module's name.
+    ImportedConstructor(SmolStr),
+    ImportedType(SmolStr),
+    ImportedTypeAndConstructor(SmolStr),
+    ImportedValue(SmolStr),
     PrivateType,
     Variable,
 }
@@ -441,7 +446,7 @@ impl<'a> Environment<'a> {
             // TODO: Improve this so that we can tell if an imported overriden
             // type is actually used or not by tracking whether usages apply to
             // the value or type scope
-            Some((ImportedType | ImportedTypeAndConstructor | PrivateType, _, _)) => {}
+            Some((ImportedType(_) | ImportedTypeAndConstructor(_) | PrivateType, _, _)) => {}
 
             Some((kind, location, false)) => {
                 // an entity was overwritten in the top most scope without being used
@@ -491,21 +496,37 @@ impl<'a> Environment<'a> {
         }
     }
 
+    fn record_unused_unqualified(&mut self, module: &SmolStr, location: SrcSpan) {
+        match self.unused_unqualified.get_mut(module) {
+            None => {
+                let _ = self
+                    .unused_unqualified
+                    .insert(module.clone(), vec![location]);
+            }
+            Some(vec) => vec.push(location),
+        }
+    }
+
     fn handle_unused(&mut self, unused: HashMap<SmolStr, (EntityKind, SrcSpan, bool)>) {
         for (name, (kind, location, _)) in unused.into_iter().filter(|(_, (_, _, used))| !used) {
             let warning = match kind {
-                EntityKind::ImportedType | EntityKind::ImportedTypeAndConstructor => {
+                EntityKind::ImportedType(module)
+                | EntityKind::ImportedTypeAndConstructor(module) => {
+                    self.record_unused_unqualified(&module, location);
                     Warning::UnusedType {
                         name,
                         imported: true,
                         location,
                     }
                 }
-                EntityKind::ImportedConstructor => Warning::UnusedConstructor {
-                    name,
-                    imported: true,
-                    location,
-                },
+                EntityKind::ImportedConstructor(module) => {
+                    self.record_unused_unqualified(&module, location);
+                    Warning::UnusedConstructor {
+                        name,
+                        imported: true,
+                        location,
+                    }
+                }
                 EntityKind::PrivateConstant => {
                     Warning::UnusedPrivateModuleConstant { name, location }
                 }
@@ -520,7 +541,10 @@ impl<'a> Environment<'a> {
                     imported: false,
                     location,
                 },
-                EntityKind::ImportedValue => Warning::UnusedImportedValue { name, location },
+                EntityKind::ImportedValue(module) => {
+                    self.record_unused_unqualified(&module, location);
+                    Warning::UnusedImportedValue { name, location }
+                }
                 EntityKind::Variable => Warning::UnusedVariable { name, location },
             };
 
@@ -596,6 +620,27 @@ impl<'a> Environment<'a> {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    pub fn emit_unused_unqualified(&self, imports: &[crate::ast::Import<()>]) {
+        for import in imports {
+            if let Some(unqualified_names) = self.unused_unqualified.get(&import.module) {
+                if unqualified_names.len() == import.unqualified.len() {
+                    if import.as_name.is_none() {
+                        // The import can be safely removed.
+                        self.warnings.emit_unused(import.location);
+                    } else if let Some(unqualified_location) = import.unqualified_location {
+                        // Only the unqualified {..} can be safely removed.
+                        self.warnings.emit_unused(unqualified_location);
+                    }
+                } else {
+                    // Otherwise, individual unqualified names can be removed.
+                    for location in unqualified_names {
+                        self.warnings.emit_unused(*location);
+                    }
+                }
+            }
         }
     }
 }

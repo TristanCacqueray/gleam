@@ -1924,11 +1924,16 @@ where
 
         // Gather imports
         let mut unqualified = vec![];
-        if self.maybe_one(&Token::Dot).is_some() {
-            let _ = self.expect_one(&Token::LeftBrace)?;
-            unqualified = self.parse_unqualified_imports()?;
-            let (_, e) = self.expect_one(&Token::RightBrace)?;
-            end = e;
+        let mut unqualified_location = None;
+        match self.maybe_one(&Token::Dot) {
+            Some((s, _)) => {
+                let _ = self.expect_one(&Token::LeftBrace)?;
+                unqualified = self.parse_unqualified_imports()?;
+                let (_, e) = self.expect_one(&Token::RightBrace)?;
+                end = e;
+                unqualified_location = Some(SrcSpan { start: s, end: e })
+            }
+            None => {}
         }
 
         // Parse as_name
@@ -1946,6 +1951,7 @@ where
                 end,
             },
             unqualified,
+            unqualified_location,
             module: module.into(),
             as_name,
             package: (),
@@ -1955,6 +1961,7 @@ where
     // [Name (as Name)? | UpName (as Name)? ](, [Name (as Name)? | UpName (as Name)?])*,?
     fn parse_unqualified_imports(&mut self) -> Result<Vec<UnqualifiedImport>, ParseError> {
         let mut imports = vec![];
+        let mut commas = vec![];
         loop {
             // parse imports
             match self.tok0.take() {
@@ -1995,11 +2002,23 @@ where
             }
             // parse comma
             match self.tok0 {
-                Some((_, Token::Comma, _)) => {
+                Some((start, Token::Comma, _)) => {
+                    commas.push(start);
                     let _ = self.next_tok();
                 }
                 _ => break,
             }
+        }
+        // Adjust unqualified location to include the surrounding comma.
+        let mut import_pos = 0;
+        for import in imports.iter_mut() {
+            if import_pos == 0 {
+                import.location.end = *commas.get(import_pos).unwrap_or(&import.location.end) + 1;
+            } else {
+                import.location.start =
+                    *commas.get(import_pos - 1).unwrap_or(&import.location.start);
+            }
+            import_pos += 1;
         }
         Ok(imports)
     }

@@ -16,6 +16,7 @@ fn remove_unused_action(src: &str) -> Option<String> {
         "result",
         "pub fn is_ok() {}\npub fn is_err() {}\npub fn all() {}",
     );
+    _ = io.src_module("map", "pub type Map(key, value)\npub fn delete() {}");
     _ = io.src_module("option", "");
 
     _ = io.src_module("app", src);
@@ -122,10 +123,11 @@ pub fn main() {
 fn test_remove_unused_qualified_action() {
     let code = "
 // test
-import result.{is_ok}
+import map.{Map, delete}
 ";
     let expected = "
 // test
+
 ";
     assert_eq!(remove_unused_action(code), Some(expected.to_string()))
 }
@@ -176,7 +178,7 @@ pub fn main() {
 ";
     let expected = "
 // test
-import result.{is_ok}
+import result.{ is_ok}
 
 pub fn main() {
   is_ok
@@ -197,7 +199,7 @@ pub fn main() {
 ";
     let expected = "
 // test
-import result.{is_ok} as res
+import result.{ is_ok} as res
 
 pub fn main() {
   is_ok

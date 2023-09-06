@@ -124,9 +124,9 @@ pub fn infer_module<A>(
 
     // Infer the types of each statement in the module
     let mut typed_statements = Vec::with_capacity(statements_count);
-    for i in statements.imports {
+    for i in &statements.imports {
         let statement = record_imported_items_for_use_detection(
-            i,
+            i.clone(),
             package,
             direct_dependencies,
             warnings,
@@ -170,6 +170,8 @@ pub fn infer_module<A>(
 
     // Generate warnings for unused items
     env.convert_unused_to_warnings();
+
+    env.emit_unused_unqualified(&statements.imports);
 
     // Remove imported types and values to create the public interface
     // Private types and values are retained so they can be used in the language
@@ -310,22 +312,26 @@ pub fn register_import(
         if value_imported && type_imported {
             environment.init_usage(
                 imported_name.clone(),
-                EntityKind::ImportedTypeAndConstructor,
+                EntityKind::ImportedTypeAndConstructor(module.clone()),
                 *location,
             );
         } else if type_imported {
             let _ = environment.imported_types.insert(imported_name.clone());
-            environment.init_usage(imported_name.clone(), EntityKind::ImportedType, *location);
+            environment.init_usage(
+                imported_name.clone(),
+                EntityKind::ImportedType(module.clone()),
+                *location,
+            );
         } else if value_imported {
             match variant {
                 Some(&ValueConstructorVariant::Record { .. }) => environment.init_usage(
                     imported_name.clone(),
-                    EntityKind::ImportedConstructor,
+                    EntityKind::ImportedConstructor(module.clone()),
                     *location,
                 ),
                 _ => environment.init_usage(
                     imported_name.clone(),
-                    EntityKind::ImportedValue,
+                    EntityKind::ImportedValue(module.clone()),
                     *location,
                 ),
             };
@@ -942,6 +948,7 @@ fn record_imported_items_for_use_detection<A>(
         module,
         as_name,
         mut unqualified,
+        unqualified_location,
         ..
     } = i;
     // Find imported module
@@ -982,6 +989,7 @@ fn record_imported_items_for_use_detection<A>(
         module,
         as_name,
         unqualified,
+        unqualified_location,
         package: module_info.package.clone(),
     }))
 }
